@@ -1,4 +1,4 @@
-use std::{io, sync::mpsc, thread, time};
+use std::{io, sync::mpsc, thread};
 
 use log::*;
 use ratatui::prelude::*;
@@ -105,14 +105,10 @@ impl App {
 
 /// A background task that logs a log entry for each log level every second.
 fn background_task() {
-    loop {
-        error!(target:"background-task", "an error");
-        warn!(target:"background-task", "a warning");
-        info!(target:"background-task", "a two line info\nsecond line");
-        debug!(target:"background-task", "a debug");
-        trace!(target:"background-task", "a trace");
-        thread::sleep(time::Duration::from_millis(1000));
-    }
+    error!(target:"background-task", "an error");
+    let big_msg: String = "A".repeat(100000);
+    error!(target:"background-task", "{big_msg}");
+    error!(target:"background-task", "an error");
 }
 
 impl Widget for &mut App {
