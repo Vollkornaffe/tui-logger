@@ -1,78 +1,16 @@
 use std::{io, sync::mpsc, thread, time};
 
 use log::*;
-use ratatui::{prelude::*, widgets::*};
+use ratatui::prelude::*;
 use std::env;
 use tui_logger::*;
 
-/// Choose the backend depending on the selected feature (crossterm or termion). This is a mutually
-/// exclusive feature, so only one of them can be enabled at a time.
-#[cfg(all(feature = "crossterm", not(feature = "termion")))]
 use self::crossterm_backend::*;
-#[cfg(all(feature = "termion", not(feature = "crossterm")))]
-use self::termion_backend::*;
-#[cfg(not(any(feature = "crossterm", feature = "termion")))]
-compile_error!("One of the features 'crossterm' or 'termion' must be enabled.");
-#[cfg(all(feature = "crossterm", feature = "termion"))]
-compile_error!("Only one of the features 'crossterm' and 'termion' can be enabled.");
+#[cfg(not(feature = "crossterm"))]
+compile_error!("this example only works with 'crossterm'");
 
 struct App {
-    mode: AppMode,
-    states: Vec<TuiWidgetState>,
-    tab_names: Vec<&'static str>,
-    selected_tab: usize,
-    progress_counter: Option<u16>,
-}
-
-#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
-enum AppMode {
-    #[default]
-    Run,
-    Quit,
-}
-
-#[derive(Debug)]
-enum AppEvent {
-    UiEvent(Event),
-    CounterChanged(Option<u16>),
-}
-
-//// Example for simple customized formatter
-struct MyLogFormatter {}
-impl LogFormatter for MyLogFormatter {
-    fn min_width(&self) -> u16 {
-        4
-    }
-    fn format(&self, _width: usize, evt: &ExtLogRecord) -> Vec<Line> {
-        let mut lines = vec![];
-        match evt.level {
-            log::Level::Error => {
-                let st = Style::new().red().bold();
-                let sp = Span::styled("======", st);
-                let mayday = Span::from(" MAYDAY MAYDAY ".to_string());
-                let sp2 = Span::styled("======", st);
-                lines.push(Line::from(vec![sp, mayday, sp2]).alignment(Alignment::Center));
-                lines.push(
-                    Line::from(format!("{}: {}", evt.level, evt.msg)).alignment(Alignment::Center),
-                );
-            }
-            _ => {
-                lines.push(Line::from(format!("{}: {}", evt.level, evt.msg)));
-            }
-        };
-
-        match evt.level {
-            log::Level::Error => {
-                let st = Style::new().blue().bold();
-                let sp = Span::styled("======", st);
-                let mayday = Span::from(" MAYDAY SEEN ? ".to_string());
-                let sp2 = Span::styled("======", st);
-                lines.push(Line::from(vec![sp, mayday, sp2]).alignment(Alignment::Center));
-            }
-            _ => {}
-        };
-        lines
-    }
+    state: TuiWidgetState,
 }
 
 fn main() -> anyhow::Result<()> {
@@ -103,36 +41,18 @@ fn main() -> anyhow::Result<()> {
 
 impl App {
     pub fn new() -> App {
-        let states = vec![
-            TuiWidgetState::new().set_default_display_level(LevelFilter::Info),
-            TuiWidgetState::new().set_default_display_level(LevelFilter::Info),
-            TuiWidgetState::new().set_default_display_level(LevelFilter::Info),
-            TuiWidgetState::new().set_default_display_level(LevelFilter::Info),
-        ];
+        let state = TuiWidgetState::new().set_default_display_level(LevelFilter::Info);
 
-        // Adding this line had provoked the bug as described in issue #69
-        // let states = states.into_iter().map(|s| s.set_level_for_target("some::logger", LevelFilter::Off)).collect();
-        let tab_names = vec!["State 1", "State 2", "State 3", "State 4"];
-        App {
-            mode: AppMode::Run,
-            states,
-            tab_names,
-            selected_tab: 0,
-            progress_counter: None,
-        }
+        App { state }
     }
 
     pub fn start(mut self, terminal: &mut Terminal<impl Backend>) -> anyhow::Result<()> {
         // Use an mpsc::channel to combine stdin events with app events
         let (tx, rx) = mpsc::channel();
         let event_tx = tx.clone();
-        let progress_tx = tx.clone();
 
         thread::spawn(move || input_thread(event_tx));
-        thread::spawn(move || progress_task(progress_tx).unwrap());
-        thread::spawn(move || background_task());
-        thread::spawn(move || background_task2());
-        thread::spawn(move || heart_task());
+        thread::spawn(background_task);
 
         self.run(terminal, rx)
     }
@@ -141,14 +61,10 @@ impl App {
     fn run(
         &mut self,
         terminal: &mut Terminal<impl Backend>,
-        rx: mpsc::Receiver<AppEvent>,
+        rx: mpsc::Receiver<Event>,
     ) -> anyhow::Result<()> {
         for event in rx {
-            match event {
-                AppEvent::UiEvent(event) => self.handle_ui_event(event),
-                AppEvent::CounterChanged(value) => self.update_progress_bar(event, value),
-            }
-            if self.mode == AppMode::Quit {
+            if self.handle_ui_event(event) {
                 break;
             }
             self.draw(terminal)?;
@@ -156,53 +72,27 @@ impl App {
         Ok(())
     }
 
-    fn update_progress_bar(&mut self, event: AppEvent, value: Option<u16>) {
-        trace!(target: "App", "Updating progress bar {:?}",event);
-        self.progress_counter = value;
-        if value.is_none() {
-            info!(target: "App", "Background task finished");
-        }
-    }
-
-    fn handle_ui_event(&mut self, event: Event) {
+    fn handle_ui_event(&mut self, event: Event) -> bool {
         debug!(target: "App", "Handling UI event: {:?}",event);
-        let state = self.selected_state();
-
         if let Event::Key(key) = event {
-            #[cfg(feature = "crossterm")]
-            let code = key.code;
-
-            #[cfg(feature = "termion")]
-            let code = key;
-
-            match code.into() {
-                Key::Char('q') => self.mode = AppMode::Quit,
-                Key::Char('\t') => self.next_tab(),
-                #[cfg(feature = "crossterm")]
-                Key::Tab => self.next_tab(),
-                Key::Char(' ') => state.transition(TuiWidgetEvent::SpaceKey),
-                Key::Esc => state.transition(TuiWidgetEvent::EscapeKey),
-                Key::PageUp => state.transition(TuiWidgetEvent::PrevPageKey),
-                Key::PageDown => state.transition(TuiWidgetEvent::NextPageKey),
-                Key::Up => state.transition(TuiWidgetEvent::UpKey),
-                Key::Down => state.transition(TuiWidgetEvent::DownKey),
-                Key::Left => state.transition(TuiWidgetEvent::LeftKey),
-                Key::Right => state.transition(TuiWidgetEvent::RightKey),
-                Key::Char('+') => state.transition(TuiWidgetEvent::PlusKey),
-                Key::Char('-') => state.transition(TuiWidgetEvent::MinusKey),
-                Key::Char('h') => state.transition(TuiWidgetEvent::HideKey),
-                Key::Char('f') => state.transition(TuiWidgetEvent::FocusKey),
+            match key.code {
+                Key::Char('q') => return true,
+                Key::Char(' ') => self.state.transition(TuiWidgetEvent::SpaceKey),
+                Key::Esc => self.state.transition(TuiWidgetEvent::EscapeKey),
+                Key::PageUp => self.state.transition(TuiWidgetEvent::PrevPageKey),
+                Key::PageDown => self.state.transition(TuiWidgetEvent::NextPageKey),
+                Key::Up => self.state.transition(TuiWidgetEvent::UpKey),
+                Key::Down => self.state.transition(TuiWidgetEvent::DownKey),
+                Key::Left => self.state.transition(TuiWidgetEvent::LeftKey),
+                Key::Right => self.state.transition(TuiWidgetEvent::RightKey),
+                Key::Char('+') => self.state.transition(TuiWidgetEvent::PlusKey),
+                Key::Char('-') => self.state.transition(TuiWidgetEvent::MinusKey),
+                Key::Char('h') => self.state.transition(TuiWidgetEvent::HideKey),
+                Key::Char('f') => self.state.transition(TuiWidgetEvent::FocusKey),
                 _ => (),
             }
         }
-    }
-
-    fn selected_state(&mut self) -> &mut TuiWidgetState {
-        &mut self.states[self.selected_tab]
-    }
-
-    fn next_tab(&mut self) {
-        self.selected_tab = (self.selected_tab + 1) % self.tab_names.len();
+        false
     }
 
     fn draw(&mut self, terminal: &mut Terminal<impl Backend>) -> anyhow::Result<()> {
@@ -211,20 +101,6 @@ impl App {
         })?;
         Ok(())
     }
-}
-
-/// A simulated task that sends a counter value to the UI ranging from 0 to 100 every second.
-fn progress_task(tx: mpsc::Sender<AppEvent>) -> anyhow::Result<()> {
-    for progress in 0..100 {
-        debug!(target:"progress-task", "Send progress to UI thread. Value: {:?}", progress);
-        tx.send(AppEvent::CounterChanged(Some(progress)))?;
-
-        trace!(target:"progress-task", "Sleep one second");
-        thread::sleep(time::Duration::from_millis(1000));
-    }
-    info!(target:"progress-task", "Progress task finished");
-    tx.send(AppEvent::CounterChanged(None))?;
-    Ok(())
 }
 
 /// A background task that logs a log entry for each log level every second.
@@ -239,47 +115,10 @@ fn background_task() {
     }
 }
 
-/// A background task for long line
-fn background_task2() {
-    loop {
-        info!(target:"background-task2", "This is a very long message, which should be wrapped on smaller screen by the standard formatter with an indentation of 9 characters.");
-        thread::sleep(time::Duration::from_millis(2000));
-    }
-}
-
-/// A background task for utf8 example
-fn heart_task() {
-    let mut line = "♥♥♥♥♥♥♥♥♥♥♥♥♥♥♥♥♥♥♥♥♥♥♥♥♥♥♥♥♥♥♥♥♥♥♥♥♥♥♥♥♥♥♥♥♥♥♥♥♥♥♥".to_string();
-    loop {
-        info!(target:"heart-task", "{}", line);
-        line = format!(".{}", line);
-        thread::sleep(time::Duration::from_millis(1500));
-    }
-}
-
 impl Widget for &mut App {
     fn render(self, area: Rect, buf: &mut Buffer) {
-        let progress_height = if self.progress_counter.is_some() {
-            3
-        } else {
-            0
-        };
-        let [tabs_area, smart_area, main_area, progress_area, help_area] = Layout::vertical([
-            Constraint::Length(3),
-            Constraint::Fill(50),
-            Constraint::Fill(30),
-            Constraint::Length(progress_height),
-            Constraint::Length(3),
-        ])
-        .areas(area);
-        // show two TuiWidgetState side-by-side
-        let [left, right] = Layout::horizontal([Constraint::Fill(1); 2]).areas(main_area);
-
-        Tabs::new(self.tab_names.iter().cloned())
-            .block(Block::default().title("States").borders(Borders::ALL))
-            .highlight_style(Style::default().add_modifier(Modifier::REVERSED))
-            .select(self.selected_tab)
-            .render(tabs_area, buf);
+        let [smart_area, help_area] =
+            Layout::vertical([Constraint::Fill(50), Constraint::Length(3)]).areas(area);
 
         TuiLoggerSmartWidget::default()
             .style_error(Style::default().fg(Color::Red))
@@ -293,51 +132,9 @@ impl Widget for &mut App {
             .output_target(true)
             .output_file(true)
             .output_line(true)
-            .state(self.selected_state())
+            .state(&self.state)
             .render(smart_area, buf);
 
-        // An example of filtering the log output. The left TuiLoggerWidget is filtered to only show
-        // log entries for the "App" target. The right TuiLoggerWidget shows all log entries.
-        let filter_state = TuiWidgetState::new()
-            .set_default_display_level(LevelFilter::Off)
-            .set_level_for_target("App", LevelFilter::Debug)
-            .set_level_for_target("background-task", LevelFilter::Info);
-        let mut formatter: Option<Box<dyn LogFormatter>> = None;
-        if cfg!(feature = "formatter") {
-            formatter = Some(Box::new(MyLogFormatter {}));
-        }
-
-        TuiLoggerWidget::default()
-            .block(Block::bordered().title("Filtered TuiLoggerWidget"))
-            .output_separator('|')
-            .output_timestamp(Some("%F %H:%M:%S%.3f".to_string()))
-            .output_level(Some(TuiLoggerLevelOutput::Long))
-            .output_target(false)
-            .output_file(false)
-            .output_line(false)
-            .style(Style::default().fg(Color::White))
-            .state(&filter_state)
-            .render(left, buf);
-
-        TuiLoggerWidget::default()
-            .block(Block::bordered().title("Unfiltered TuiLoggerWidget"))
-            .opt_formatter(formatter)
-            .output_separator('|')
-            .output_timestamp(Some("%F %H:%M:%S%.3f".to_string()))
-            .output_level(Some(TuiLoggerLevelOutput::Long))
-            .output_target(false)
-            .output_file(false)
-            .output_line(false)
-            .style(Style::default().fg(Color::White))
-            .render(right, buf);
-
-        if let Some(percent) = self.progress_counter {
-            Gauge::default()
-                .block(Block::bordered().title("progress-task"))
-                .gauge_style((Color::White, Modifier::ITALIC))
-                .percent(percent)
-                .render(progress_area, buf);
-        }
         if area.width > 40 {
             Text::from(vec![
                 "Q: Quit | Tab: Switch state | ↑/↓: Select target | f: Focus target".into(),
@@ -376,47 +173,11 @@ mod crossterm_backend {
         execute!(io::stdout(), LeaveAlternateScreen, DisableMouseCapture)
     }
 
-    pub fn input_thread(tx_event: mpsc::Sender<AppEvent>) -> anyhow::Result<()> {
+    pub fn input_thread(tx_event: mpsc::Sender<Event>) -> anyhow::Result<()> {
         trace!(target:"crossterm", "Starting input thread");
         while let Ok(event) = event::read() {
             trace!(target:"crossterm", "Stdin event received {:?}", event);
-            tx_event.send(AppEvent::UiEvent(event))?;
-        }
-        Ok(())
-    }
-}
-
-/// A module for termion specific code
-#[cfg(feature = "termion")]
-mod termion_backend {
-    use super::*;
-    use termion::screen::IntoAlternateScreen;
-    pub use termion::{
-        event::{Event, Key},
-        input::{MouseTerminal, TermRead},
-        raw::IntoRawMode,
-    };
-
-    pub fn init_terminal() -> io::Result<Terminal<impl Backend>> {
-        trace!(target:"termion", "Initializing terminal");
-        let stdout = io::stdout().into_raw_mode()?;
-        let stdout = MouseTerminal::from(stdout);
-        let stdout = stdout.into_alternate_screen()?;
-        let backend = TermionBackend::new(stdout);
-        Terminal::new(backend)
-    }
-
-    pub fn restore_terminal() -> io::Result<()> {
-        trace!(target:"termion", "Restoring terminal");
-        Ok(())
-    }
-
-    pub fn input_thread(tx_event: mpsc::Sender<AppEvent>) -> anyhow::Result<()> {
-        trace!(target:"termion", "Starting input thread");
-        for event in io::stdin().events() {
-            let event = event?;
-            trace!(target:"termion", "Stdin event received {:?}", event);
-            tx_event.send(AppEvent::UiEvent(event))?;
+            tx_event.send(event)?;
         }
         Ok(())
     }
